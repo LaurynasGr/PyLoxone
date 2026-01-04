@@ -46,6 +46,7 @@ from .message import (BaseMessage, BinaryFile, Keepalive, LLResponse,
                       MessageType, TextMessage, check_and_decode_if_needed,
                       parse_header, parse_message)
 from .websocket_protocol import LoxoneClientConnection
+from .audioserver import authenticate_with_audio_server
 
 _LOGGER = logging.getLogger(__name__)
 import warnings
@@ -69,9 +70,9 @@ class MessageForQueue:
 
 
 class LoxoneBaseConnection:
-    _URL_FORMAT = "ws://{url}/ws/rfc6455"
-    _SSL_URL_FORMAT = "wss://{url}/ws/rfc6455"
-
+    _URL_FORMAT = "ws://{url}{suffix}"
+    _SSL_URL_FORMAT = "wss://{url}{suffix}"
+    _BASE_WS_SUFFIX = "/ws/rfc6455"
     def __init__(
         self,
         host: str,
@@ -105,6 +106,7 @@ class LoxoneBaseConnection:
         self.port = port
         self.timeout = None if timeout == 0 else timeout
         self.connection: wslib.ClientConnection | None = None
+        self.audio_connection: wslib.ClientConnection | None = None
         self._pending_task = []
         self._closed = False
         self._key_update_event: Optional[asyncio.Event] = None
@@ -426,7 +428,10 @@ class LoxoneBaseConnection:
 
 class LoxoneConnection(LoxoneBaseConnection):
     connection: Optional[LoxoneClientConnection]
+    audio_connection: Optional[wslib.ClientConnection]
     _recv_loop: Optional["asyncio.Task[None]"]
+    _audio_recv_loop: Optional["asyncio.Task[None]"]
+    _audio_connection_id: Optional[str] = None
 
     async def __aenter__(self) -> "LoxoneConnection":
         return self
@@ -443,6 +448,8 @@ class LoxoneConnection(LoxoneBaseConnection):
         self, callback: Optional[Callable[[str, Any], Optional[Awaitable[None]]]] = None
     ) -> None:
         """Open, and start listening."""
+
+        _LOGGER.info("Starting listening...")
 
         if not self.connection:
             _LOGGER.debug("No existing connection found. Opening a new connection.")
@@ -964,8 +971,20 @@ class LoxoneConnection(LoxoneBaseConnection):
             raise
 
         # Establish websocket connection
+        self.connection = await asyncio.wait_for(
+            self.establish_ws_connection(
+                url=self.url,
+                suffix=self._BASE_WS_SUFFIX,
+                create_connection=LoxoneClientConnection
+            ),
+            timeout=(self.timeout or TIMEOUT) * 2,
+        )
+        return self.connection
+
+    async def establish_ws_connection(self, url: str, suffix: str, **kwargs) -> LoxoneClientConnection:
+        _LOGGER.info(f"Establishing WebSocket connection to {url}{suffix}")
         try:
-            params = {"url": self.url}
+            params = {"url": url, "suffix": suffix}
             if self.scheme == "https":
                 base_url = self._SSL_URL_FORMAT.format(**params)
             else:
@@ -976,9 +995,9 @@ class LoxoneConnection(LoxoneBaseConnection):
                     wslib.connect(
                         base_url,
                         open_timeout=self.timeout or TIMEOUT,
-                        create_connection=LoxoneClientConnection,
                         compression=None,
                         max_size=MAX_WEBSOCKET_MESSAGE_SIZE,
+                        **kwargs
                     ),
                     timeout=(self.timeout or TIMEOUT) * 2,
                 )
@@ -997,7 +1016,7 @@ class LoxoneConnection(LoxoneBaseConnection):
                     f"Unexpected error connecting to websocket: {e}"
                 ) from e
 
-            _LOGGER.debug(f"Websocket connection established to {base_url}")
+            _LOGGER.info(f"WebSocket connection established to {base_url}")
             return connection
 
         except Exception as e:
@@ -1061,6 +1080,19 @@ class LoxoneConnection(LoxoneBaseConnection):
                 _LOGGER.warning(f"Error closing websocket connection: {e}")
             finally:
                 self.connection = None
+
+        # Close audio WebSocket connection if present
+        if self.audio_connection:
+            try:
+                if self.audio_connection.state != self.audio_connection.state.CLOSED:
+                    await asyncio.wait_for(self.audio_connection.close(), timeout=5.0)
+                    _LOGGER.debug("Audio WebSocket connection closed")
+            except asyncio.TimeoutError:
+                _LOGGER.warning("Timeout closing audio WebSocket connection")
+            except Exception as e:
+                _LOGGER.warning(f"Error closing audio WebSocket connection: {e}")
+            finally:
+                self.audio_connection = None
 
         _LOGGER.debug("Connection closed successfully.")
 
@@ -1387,3 +1419,108 @@ class LoxoneConnection(LoxoneBaseConnection):
 
         except Exception as e:
             _LOGGER.error(f"Error in websocket event handler: {e}", exc_info=True)
+    
+    async def start_listening_to_audio(self, audio_callback: Callable[[str, Any], Optional[Awaitable[None]]]) -> None:
+        """Open audio connection, and start listening."""
+
+        while not self._shutdown_event.is_set():
+            _LOGGER.info("Starting listening to audio events...")
+
+            if self.audio_connection and self.audio_connection.state != self.audio_connection.state.CLOSED:
+                await self.audio_connection.close()
+
+            self.audio_connection = await self.open_audio()
+            if not self.audio_connection:
+                _LOGGER.error("Failed to open audio connection")
+                return None
+
+            # noinspection PyUnreachableCode
+            self._pending_audio_task = [
+                asyncio.create_task(self._do_start_listening_to_audio(self.audio_connection, audio_callback)),
+            ]
+
+            got_ping_timeout = False
+            try:
+                done, _ = await asyncio.wait(
+                    self._pending_audio_task, return_when=asyncio.FIRST_EXCEPTION
+                )
+                for task in done:
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                        # Don't raise, this is expected during shutdown
+            except Exception as e:
+                if "keepalive ping timeout" in str(e):
+                    got_ping_timeout = True
+                else:
+                    _LOGGER.error(f"Audio task {task} raised an exception: {e}", exc_info=True)
+            finally:
+                # Cancel pending tasks
+                _LOGGER.info("Cancelling pending audio tasks...")
+                for task in self._pending_audio_task:
+                    if task and not task.done():
+                        task.cancel()
+
+                if self._pending_audio_task:
+                    await asyncio.gather(*self._pending_audio_task, return_exceptions=True)
+
+                if got_ping_timeout:
+                    _LOGGER.error(f"Keepalive ping timeout. Reconnecting to audio server...")
+                    continue
+
+                return None
+
+    async def open_audio(self) -> LoxoneClientConnection | None:
+        if not self._audio_connection_id:
+            _LOGGER.error("Audio connection ID not set")
+            return None
+
+        for attempt in range(RECONNECT_TRIES):
+            _LOGGER.info(f"Attempt {attempt + 1} to authenticate with audio server...")
+            audio_connection = await asyncio.wait_for(
+                self.establish_ws_connection(
+                    url=self.url,
+                    suffix=f"/proxy/{self._audio_connection_id}",
+                    subprotocols=["remotecontrol"]
+                ),
+                timeout=(self.timeout or TIMEOUT) * 2,
+            )
+
+            try:
+                await authenticate_with_audio_server(audio_connection, self._token.token, self.username)
+                return audio_connection
+            except Exception as e:
+                if attempt < RECONNECT_TRIES - 1:
+                    _LOGGER.info(
+                        f"Failed to authenticate with audio server: {e}. Trying again in {RECONNECT_DELAY} seconds..."
+                    )
+                    if audio_connection.state != audio_connection.state.CLOSED:
+                        await audio_connection.close()
+                    await asyncio.sleep(RECONNECT_DELAY)
+                else:
+                    _LOGGER.error(f"Failed to authenticate with audio server: {e}. Max tries exceeded. Stopping.")
+                    if audio_connection.state != audio_connection.state.CLOSED:
+                        await audio_connection.close()
+                    return None
+
+    async def _do_start_listening_to_audio(
+        self,
+        connection: LoxoneClientConnection,
+        audio_callback: Callable[[Any], Optional[Awaitable[None]]],
+    ) -> None:
+        _LOGGER.info("Starting audio listening loop...")
+        async def _run_callback(msg):
+            try:
+                await audio_callback(msg)
+            except Exception as e:
+                _LOGGER.error(f"Audio Callback error: {e}", exc_info=True)
+        
+        async for message in connection:
+            if message.startswith("{"):
+                parsed_message = json.loads(message)
+                if 'audio_event' in parsed_message:
+                    asyncio.create_task(_run_callback(parsed_message))
+                    continue
+
+            _LOGGER.info(f"Unknown message from audio server: {message}")

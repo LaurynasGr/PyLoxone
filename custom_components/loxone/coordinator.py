@@ -65,6 +65,20 @@ class LoxoneCoordinator(DataUpdateCoordinator):
             _LOGGER.error("Could not connect to Loxone Miniserver")
             raise e
 
+        try:
+            if "mediaServer" in self.api.structure_file and isinstance(self.api.structure_file["mediaServer"], dict):
+                first_server_id = list(self.api.structure_file["mediaServer"].keys())[0]
+                first_server_config = self.api.structure_file["mediaServer"][first_server_id]
+
+                if first_server_config and first_server_config["internal"] == False and first_server_config["uuidAction"] != "":
+                    self.api._audio_connection_id = first_server_config["uuidAction"]
+                else:
+                    _LOGGER.info("Unknown Loxone Audioserver configuration found. Ignoring it.")
+            else:
+                _LOGGER.info("No Loxone Audioserver found in structure file")
+        except Exception as e:
+            _LOGGER.error("Could not connect to Loxone Audioserver")
+
         self.miniserver = MiniServer(
             self.hass, self.api.structure_file, self.config_entry
         )

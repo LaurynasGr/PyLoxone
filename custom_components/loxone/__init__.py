@@ -34,7 +34,7 @@ from .const import (ATTR_AREA_CREATE, ATTR_CODE, ATTR_COMMAND, ATTR_DEVICE,
                     CONF_LIGHTCONTROLLER_SUBCONTROLS_GEN, CONF_SCENE_GEN,
                     CONF_SCENE_GEN_DELAY, DEFAULT, DEFAULT_DELAY_SCENE,
                     DEFAULT_PORT, DOMAIN, DOMAIN_DEVICES, ERROR_VALUE, EVENT,
-                    LOXONE_PLATFORMS, SECUREDSENDDOMAIN, SENDDOMAIN, cfmt)
+                    LOXONE_PLATFORMS, SECUREDSENDDOMAIN, SENDDOMAIN, cfmt, AUDIO_EVENT)
 from .coordinator import LoxoneCoordinator
 from .helpers import get_miniserver_type
 from .miniserver import MiniServer, get_miniserver_from_hass
@@ -274,7 +274,7 @@ async def async_setup_entry(hass, config_entry):
         try:
             task.result()
         except LoxoneTokenError as e:
-            _LOGGER.debug(
+            _LOGGER.error(
                 "Token is not valid anymore. Delete token and try to reloading Loxone integration."
             )
             # First we delete the invalid token then try to reload
@@ -289,13 +289,13 @@ async def async_setup_entry(hass, config_entry):
             # Loxone-Integration neu laden
             hass.async_create_task(_reload_after_delay(1.0))
         except LoxoneOutOfServiceException as e:
-            _LOGGER.debug(
+            _LOGGER.error(
                 "Loxone LoxoneOutOfServiceException received. Try to reloading Loxone integration."
             )
             # Loxone-Integration neu laden
             hass.async_create_task(_reload_after_delay(1.0))
         except LoxoneConnectionError as e:
-            _LOGGER.debug(
+            _LOGGER.error(
                 "Loxone LoxoneConnectionError received. Try to reloading Loxone integration."
             )
             # Loxone-Integration neu laden
@@ -304,7 +304,7 @@ async def async_setup_entry(hass, config_entry):
             LoxoneConnectionClosedOk,
             websockets.exceptions.ConnectionClosedOK,
         ) as e:
-            _LOGGER.debug(
+            _LOGGER.error(
                 "Loxone LoxoneConnectionClosedOk received. Mostly a timeout Problem. Try to reloading Loxone integration."
             )
             # Loxone-Integration neu laden
@@ -318,6 +318,13 @@ async def async_setup_entry(hass, config_entry):
         """Fire message on HomeAssistant Bus."""
         _LOGGER.debug(f"{message}")
         hass.bus.async_fire(EVENT, message)
+
+    # Audio server produces many messages during audio playback and we don't want to flood loxone_event namespace with them.
+    # We only need to listen to them in the media_player entity so will subscribe to it there directly.
+    async def audio_message_callback(message):
+        """Fire audio message on HomeAssistant Bus."""
+        _LOGGER.debug(f"{message}")
+        hass.bus.async_fire(AUDIO_EVENT, message)
 
     async def handle_websocket_command(call):
         """Handle websocket command services."""
@@ -538,6 +545,9 @@ async def async_setup_entry(hass, config_entry):
                 coordinator.api.start_listening(callback=message_callback)
             )
             listening_task.add_done_callback(handle_task_result)
+            asyncio.create_task(
+                coordinator.api.start_listening_to_audio(audio_callback=audio_message_callback)
+            )
 
         except Exception as e:
             raise e
