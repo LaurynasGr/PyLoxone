@@ -33,6 +33,7 @@ DEFAULT_DELAY_SCENE = 3
 DEFAULT_IP = ""
 
 EVENT = "loxone_event"
+AUDIO_EVENT = "loxone_audio_event"
 DOMAIN = "loxone"
 LOX_CONFIG = "loxconfig"
 
